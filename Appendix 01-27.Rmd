@@ -1,0 +1,1309 @@
+---
+title: "Appendix"
+author: "Chris Perfitt"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,  # hide code
+  message = FALSE,  # hide package messages
+  warning = FALSE   # hide warnings
+)
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(broom)
+library(plm)
+library(purrr)
+library(stargazer)
+library(ggforce)
+library(ggrepel)
+library(scales)
+library(strucchange)
+library(lmtest)
+library(sandwich)
+library(ARDL)
+library(zoo)
+library(dplyr)
+library(tibble)
+library(knitr)
+library(car)
+library(kableExtra)
+```
+
+```{r}
+pop_raw <- read_csv(
+  "/Users/chris/Desktop/CADPOP.csv",
+  skip = 10,
+  show_col_types = FALSE
+)
+
+pop_raw <- pop_raw %>%
+  mutate(across(everything(), as.character))
+
+cad_pop <- pop_raw %>%
+  filter(`Age group 3 6` == "All ages") %>%
+  pivot_longer(
+    cols      = -`Age group 3 6`,
+    names_to  = "Year",
+    values_to = "Population"
+  ) %>%
+  mutate(
+    Year       = as.integer(Year),
+    Population = readr::parse_number(Population),
+    COUNTRY    = "Canada"
+  ) %>%
+  select(COUNTRY, Year, Population)
+```
+
+```{r}
+mfp_raw <- read_csv(
+  "/Users/chris/Desktop/CADMFP.csv",
+  skip = 10,
+  show_col_types = FALSE
+)
+
+mfp_raw <- mfp_raw %>%
+  mutate(across(everything(), as.character))
+
+cad_mfp <- mfp_raw %>%
+  filter(`North American Industry Classification System (NAICS) 2` ==
+           "Total economy 3") %>%
+  pivot_longer(
+    cols      = -`North American Industry Classification System (NAICS) 2`,
+    names_to  = "quarter",
+    values_to = "index"
+  ) %>%
+  mutate(
+    index = readr::parse_number(index),
+    Year  = as.integer(sub(".* ", "", quarter))
+  ) %>%
+  group_by(Year) %>%
+  summarise(
+    MFP_index = mean(index, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  mutate(COUNTRY = "Canada") %>%
+  select(COUNTRY, Year, MFP_index)
+```
+
+```{r}
+cad_gdp_raw <- read_csv(
+  "/Users/chris/Desktop/CADGDP.csv",
+  show_col_types = FALSE
+)
+
+cad_gdp <- cad_gdp_raw %>%
+  # Restrict to the series you actually want
+  filter(
+    GEO      == "Canada",
+    Estimates == "Gross domestic product at market prices",
+    Prices   == "Chained (2017) dollars"
+  ) %>%
+  transmute(
+    COUNTRY   = GEO,
+    Year      = as.integer(REF_DATE),
+    gdp_level = as.numeric(VALUE)
+  )
+```
+
+```{r}
+debt_raw <- read_csv(
+  "/Users/chris/Desktop/CAD DEBT DATA.csv",
+  col_types = cols(.default = "c"),
+  show_col_types = FALSE
+)
+
+# All columns that are 4-digit years
+year_cols <- grep("^[0-9]{4}$", names(debt_raw), value = TRUE)
+
+# If there are multiple countries/indicators, filter here. If it's just Canada, this is harmless.
+debt_ca_raw <- debt_raw %>%
+  filter(COUNTRY == "Canada")
+
+cad_debt <- debt_ca_raw %>%
+  pivot_longer(
+    cols      = all_of(year_cols),
+    names_to  = "Year",
+    values_to = "Debt"
+  ) %>%
+  mutate(
+    Year     = as.integer(Year),
+    debt_gdp = readr::parse_number(Debt),  # % of GDP
+    COUNTRY  = COUNTRY                      # keep the IMF country name
+  ) %>%
+  select(COUNTRY, Year, debt_gdp) %>%
+  filter(!is.na(Year), !is.na(debt_gdp)) %>%
+  arrange(Year)
+
+# sanity check
+nrow(cad_debt)
+range(cad_debt$Year)
+head(cad_debt)
+distinct(cad_debt, COUNTRY)
+```
+
+```{r}
+ca_panel <- reduce(
+  list(cad_pop, cad_mfp, cad_gdp, cad_debt),
+  ~ inner_join(.x, .y, by = c("COUNTRY", "Year"))
+) %>%
+  filter(COUNTRY == "Canada") %>%
+  arrange(Year)
+ca <- ca_panel %>%
+  arrange(Year) %>%
+  mutate(
+    gdp_per_capita = (gdp_level * 1e6) / Population,
+    log_gdppc      = log(gdp_per_capita),
+    log_mfp        = log(MFP_index),
+    gdp_growth     = 100 * (gdp_level / dplyr::lag(gdp_level) - 1)
+  ) %>%
+  filter(!is.na(debt_gdp), !is.na(gdp_growth)) %>%
+  arrange(Year)
+```
+
+```{r}
+canada <- ca %>%
+  select(COUNTRY, Year, gdp_growth, debt_gdp,
+         gdp_per_capita, log_gdppc, log_mfp) %>%
+  arrange(Year) %>%
+  mutate(
+    gdppc_growth = 100 * (gdp_per_capita / dplyr::lag(gdp_per_capita) - 1)
+  )
+```
+
+```{r}
+canada_master <- ca %>%
+  arrange(Year) %>%
+  mutate(
+    # Growth rates
+    delta_mfp   = 100 * (log_mfp - dplyr::lag(log_mfp, 1)),
+    debt_lag1   = dplyr::lag(debt_gdp, 1),
+    debt_lag2   = dplyr::lag(debt_gdp, 2),
+    debt_lag1_2 = debt_lag1^2,
+    debt_lag2_2 = debt_lag2^2,
+
+    # Crisis dummies
+    d_0809 = ifelse(Year %in% c(2008, 2009), 1, 0),
+    d_2021 = ifelse(Year %in% c(2020, 2021), 1, 0)
+  )
+```
+
+```{r}
+canada_delta <- canada %>%
+  arrange(Year) %>%
+  mutate(
+    # MFP growth in percentage points
+    delta_mfp = 100 * (log_mfp - dplyr::lag(log_mfp, 1))
+  ) %>%
+  drop_na(delta_mfp, gdp_growth, debt_gdp, log_mfp)
+```
+
+```{r}
+canada_dum <- canada_delta %>%
+  mutate(
+    d_0809 = ifelse(Year %in% c(2008, 2009), 1, 0),
+    d_2021 = ifelse(Year %in% c(2020, 2021), 1, 0)
+  )
+```
+
+```{r}
+key_years <- cad_debt %>%
+  filter(Year %in% c(1990, 1995, 2000, 2007, 2008, 2009, 2019, 2020, 2021, 2023)) %>%
+  select(Year, debt_gdp) %>%
+  arrange(Year)
+
+kable(key_years, 
+      col.names = c("Year", "Debt-to-GDP (%)"),
+      align = c("l", "r"))
+```
+
+
+# Time Series Graphs:
+
+```{r}
+ggplot(ca, aes(x = Year)) + 
+  geom_line(aes(y = gdp_growth * 10, color = "GDP Growth (%)"), linewidth = 1.2) +
+  scale_y_continuous( sec.axis = sec_axis(~ . / 5, name = "GDP Growth (%)")
+  ) +
+  scale_color_manual(values = c("GDP Growth (%)" = "#D55E00")) +
+    labs(
+    title = "Canada: GDP Growth",
+    x = "Year",
+    color = ""
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "bottom")
+```
+
+
+```{r}
+ggplot(ca, aes(x = Year)) +
+  # Add shaded regions for crisis periods FIRST (so they're in background)
+  annotate("rect", xmin = 2008, xmax = 2009, ymin = -Inf, ymax = Inf,
+           alpha = 0.2, fill = "gray") +
+  annotate("rect", xmin = 2020, xmax = 2021, ymin = -Inf, ymax = Inf,
+           alpha = 0.2, fill = "gray") +
+  
+  # Your existing lines
+  geom_line(aes(y = debt_gdp, color = "Debt-to-GDP (%)"), linewidth = 1.2) +
+  geom_line(aes(y = gdp_growth * 10, color = "GDP Growth (%)"), linewidth = 1.2) +
+  
+  scale_y_continuous(
+    name = "Debt-to-GDP (%)",
+    sec.axis = sec_axis(~ . / 5, name = "GDP Growth (%)")
+  ) +
+  scale_color_manual(values = c("Debt-to-GDP (%)" = "#0072B2",
+                                "GDP Growth (%)" = "#D55E00")) +
+  labs(
+    title = "Canada: Debt-to-GDP & GDP Growth",
+    x = "Year",
+    color = ""
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "bottom")
+```
+```{r}
+ca_pop <- ca %>%
+  arrange(Year) %>%
+  mutate(
+    pop_growth = 100 * (Population / dplyr::lag(Population) - 1)
+  ) %>%
+  filter(!is.na(pop_growth), !is.na(gdp_growth))
+
+ggplot(ca_pop, aes(x = Year)) +
+  geom_line(aes(y = pop_growth, color = "Population growth (%)"), linewidth = 1.2) +
+  geom_line(aes(y = gdp_growth, color = "GDP growth (%)"), linewidth = 1.2) +
+  scale_y_continuous(
+    name = "Population growth (%)",
+    sec.axis = sec_axis(~ ., name = "GDP growth (%)")  # same scale on both axes
+  ) +
+  scale_color_manual(
+    values = c(
+      "Population growth (%)" = "#0072B2",
+      "GDP growth (%)"        = "#D55E00"
+    )
+  ) +
+  labs(
+    title = "Canada: Population Growth vs GDP Growth",
+    x = "Year",
+    color = ""
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+ca_mfp <- ca %>%
+  arrange(Year) %>%
+  mutate(
+    mfp_growth = 100 * (log_mfp - dplyr::lag(log_mfp))  # ≈ % change in MFP
+  ) %>%
+  filter(!is.na(mfp_growth), !is.na(gdp_growth))
+
+ggplot(ca_mfp, aes(x = Year)) +
+  geom_line(aes(y = mfp_growth, color = "MFP growth (%)"), linewidth = 1.2) +
+  geom_line(aes(y = gdp_growth, color = "GDP growth (%)"), linewidth = 1.2) +
+  scale_y_continuous(
+    name = "MFP growth (%)",
+    sec.axis = sec_axis(~ ., name = "GDP growth (%)")
+  ) +
+  scale_color_manual(
+    values = c(
+      "MFP growth (%)" = "#0072B2",
+      "GDP growth (%)" = "#D55E00"
+    )
+  ) +
+  labs(
+    title = "Canada: MFP Growth vs GDP Growth",
+    x = "Year",
+    color = ""
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+# ADF Test
+
+```{r}
+library(urca)
+
+adf_ur <- function(x, max_lags = 6, type = c("none","drift","trend")) {
+  type <- match.arg(type)
+  # choose lag length by AIC over 0..max_lags
+  fits <- lapply(0:max_lags, \(L) ur.df(x, type = type, lags = L, selectlags = "Fixed"))
+  aics <- sapply(fits, \(m) AIC(lm(m@testreg)))
+  best <- fits[[which.min(aics)]]
+  list(best = best, aic = aics)
+}
+
+# debt and log mfp: usually include drift or trend
+debt_adf_drift <- adf_ur(ca$debt_gdp, type="drift")
+mfp_adf_trend  <- adf_ur(ca$log_mfp,  type="trend")
+
+# growth rates: usually "none" or "drift"
+gdpgr_adf_none <- adf_ur(ca$gdp_growth, type="none")
+dmfp_adf_none  <- adf_ur(100*diff(ca$log_mfp), type="none")
+
+summary(debt_adf_drift$best)
+summary(mfp_adf_trend$best)
+summary(gdpgr_adf_none$best)
+summary(dmfp_adf_none$best)
+```
+
+# Baseline Regression 
+
+
+```{r}
+canada_baseline <- canada %>%
+  arrange(Year) %>%
+  mutate(
+    delta_mfp = 100 * (log_mfp - dplyr::lag(log_mfp, 1))
+  ) %>%
+  drop_na(gdp_growth, debt_gdp, delta_mfp)
+
+m_baseline_nolag <- lm(
+  gdp_growth ~ debt_gdp + delta_mfp,
+  data = canada_baseline
+)
+m_baseline_nolag_quad <- lm(
+  gdp_growth ~ debt_gdp + I(debt_gdp^2) + delta_mfp,
+  data = canada_baseline
+)
+
+stargazer(
+  m_baseline_nolag, m_baseline_nolag_quad,
+  type = "text",
+  title = "Canada: Baseline GDP Growth Regressions (No Lag)",
+  column.labels = c("Linear", "Quadratic"),
+  dep.var.labels = "Real GDP Growth (%)",
+  covariate.labels = c(
+    "Debt-to-GDP (t)",
+    "Debt-to-GDP² (t)",
+    "Δ log(MFP)"
+  ),
+  omit.stat = c("f", "ser"),
+  digits = 3,
+  no.space = TRUE
+)
+```
+
+Turning Points
+```{r}
+b1 <- coef(m_baseline_nolag_quad)["debt_gdp"]
+b2 <- coef(m_baseline_nolag_quad)["I(debt_gdp^2)"]
+
+# turning point
+tp_baseline <- -b1 / (2 * b2)
+tp_baseline
+```
+
+
+Plotting the baseline:
+```{r}
+debt_seq <- seq(
+  min(canada_baseline$debt_gdp),
+  max(canada_baseline$debt_gdp),
+  length.out = 100
+)
+
+# Hold MFP growth at its sample mean
+mfp_mean <- mean(canada_baseline$delta_mfp, na.rm = TRUE)
+
+# Prediction dataframe
+pred_df <- data.frame(
+  debt_gdp = debt_seq,
+  delta_mfp = mfp_mean
+)
+
+# Predicted GDP growth from quadratic model
+pred_df$gdp_pred <- predict(
+  m_baseline_nolag_quad,
+  newdata = pred_df
+)
+ggplot(pred_df, aes(x = debt_gdp, y = gdp_pred)) +
+  geom_line(size = 1.1) +
+  geom_vline(
+    xintercept = tp_baseline,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Fitted Relationship Between Debt-to-GDP and GDP Growth",
+    subtitle = "Quadratic specification with Δlog(MFP) held at its mean",
+    x = "Debt-to-GDP Ratio (%)",
+    y = "Predicted Real GDP Growth (%)"
+  ) +
+  annotate(
+  "text",
+  x = tp_baseline,
+  y = max(pred_df$gdp_pred),
+  label = paste0("Turning point ≈ ", round(tp_baseline, 1), "%"),
+  hjust = -0.1,
+  vjust = 2
+) + 
+  theme_minimal()
+
+```
+
+## Baseline Regression Tests:
+
+Joint F-Test on Debt Terms:
+
+```{r}
+linearHypothesis(
+  m_baseline_nolag_quad,
+  c("debt_gdp = 0", "I(debt_gdp^2) = 0"),
+  vcov = vcovHAC(m_baseline_nolag_quad)
+)
+```
+RESET Test:
+
+```{r}
+resettest(m_baseline_nolag, power = 2:3, type = "fitted")
+resettest(m_baseline_nolag_quad, power = 2:3, type = "fitted")
+```
+Heteroskedasticity Test:
+
+```{r}
+bptest(m_baseline_nolag_quad)
+```
+Serial Correlation Test:
+
+```{r}
+bgtest(m_baseline_nolag_quad, order = 2)
+```
+HAC Inference Test:
+
+```{r}
+coeftest(m_baseline_nolag_quad, vcov = vcovHAC(m_baseline_nolag_quad))
+```
+
+
+## 1 Year Debt Lag
+
+```{r}
+canada_delta <- canada %>%
+  arrange(Year) %>%
+  mutate(
+    delta_mfp   = 100 * (log_mfp - dplyr::lag(log_mfp, 1)),
+    debt_lag1   = dplyr::lag(debt_gdp, 1),
+    debt_lag1_2 = debt_lag1^2
+  ) %>%
+  drop_na(delta_mfp, gdp_growth, debt_lag1, debt_lag1_2)
+```
+
+```{r}
+m_dynamic_lag <- lm(
+  gdp_growth ~ debt_lag1 + debt_lag1_2 + delta_mfp,
+  data = canada_delta
+)
+stargazer(
+  m_dynamic_lag,
+  type = "text",
+  title = "Canada: GDP Growth with Lagged Debt-to-GDP",
+  dep.var.labels = "Real GDP Growth (%)",
+  covariate.labels = c(
+    "Lagged Debt-to-GDP (t−1)",
+    "Lagged Debt-to-GDP Squared (t−1)",
+    "Δ log(MFP)"
+  ),
+  omit.stat = c("f", "ser"),
+  digits = 3,
+  no.space = TRUE
+)
+```
+
+Turning Points:
+```{r}
+b <- coef(m_dynamic_lag)
+
+tp <- -b["debt_lag1"] / (2 * b["debt_lag1_2"])
+tp
+```
+
+
+## 2 Year Debt Lag
+
+```{r}
+canada_delta <- canada %>%
+  arrange(Year) %>%
+  mutate(
+    delta_mfp   = 100 * (log_mfp - dplyr::lag(log_mfp, 1)),
+    debt_lag2   = dplyr::lag(debt_gdp, 2),
+    debt_lag2_2 = debt_lag2^2
+  ) %>%
+  drop_na(delta_mfp, gdp_growth, debt_lag2, debt_lag2_2)
+```
+
+```{r}
+m_dynamic_lag2 <- lm(
+  gdp_growth ~ debt_lag2 + debt_lag2_2 + delta_mfp,
+  data = canada_delta
+)
+
+stargazer(
+  m_dynamic_lag2,
+  type = "text",
+  title = "Canada: GDP Growth with 2-Year Lagged Debt-to-GDP",
+  dep.var.labels = "Real GDP Growth (%)",
+  covariate.labels = c(
+    "Debt-to-GDP (t−2)",
+    "Debt-to-GDP Squared (t−2)",
+    "Δ log(MFP)"
+  ),
+  omit.stat = c("f", "ser"),
+  digits = 3,
+  no.space = TRUE
+)
+```
+
+```{r}
+b <- coef(m_dynamic_lag2)
+
+tp <- -b["debt_lag2"] / (2 * b["debt_lag2_2"])
+tp
+```
+
+
+## Graphing the Lag Effects:
+
+```{r}
+canada_lags_plot <- canada_master %>%
+  select(Year, gdp_growth, debt_gdp, debt_lag1, debt_lag2) %>%
+  drop_na()
+
+ggplot(canada_lags_plot, aes(x = Year)) +
+  geom_line(aes(y = gdp_growth, color = "GDP Growth"), linewidth = 1.2) +
+  geom_line(aes(y = debt_gdp / 5, color = "Debt-to-GDP (t) / 5"),
+            linewidth = 1.2, linetype = "solid") +
+  labs(
+    title = "Canada: GDP Growth and Current Debt-to-GDP",
+    x = "Year",
+    y = "Scaled Values",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggplot(canada_lags_plot, aes(x = Year)) +
+  geom_line(aes(y = gdp_growth, color = "GDP Growth"), linewidth = 1.2) +
+  geom_line(aes(y = debt_lag1 / 5, color = "Debt-to-GDP (t−1) / 5"),
+            linewidth = 1.2, linetype = "solid") +
+  labs(
+    title = "Canada: GDP Growth and 1-Year Lagged Debt-to-GDP",
+    x = "Year",
+    y = "Scaled Values",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+ggplot(canada_lags_plot, aes(x = Year)) +
+  geom_line(aes(y = gdp_growth, color = "GDP Growth"), linewidth = 1.2) +
+  geom_line(aes(y = debt_lag2 / 5, color = "Debt-to-GDP (t−2) / 5"),
+            linewidth = 1.2, linetype = "solid") +
+  labs(
+    title = "Canada: GDP Growth and 2-Year Lagged Debt-to-GDP",
+    x = "Year",
+    y = "Scaled Values",
+    color = ""
+  ) +
+  theme_linedraw() +
+  theme(legend.position = "bottom")
+
+```
+
+## Lagged Interaction Terms:
+
+```{r}
+canada_me <- canada_dum %>%
+  arrange(Year) %>%
+  mutate(
+    debt_lag1   = dplyr::lag(debt_gdp, 1),
+    debt_lag1_2 = debt_lag1^2,
+
+    # interactions from the board idea
+    dL1_x_dmfp  = debt_lag1 * delta_mfp,
+    dL1_x_0809  = debt_lag1 * d_0809,
+    dL1_x_2021  = debt_lag1 * d_2021
+  ) %>%
+  drop_na(gdp_growth, debt_lag1, debt_lag1_2, delta_mfp, d_0809, d_2021)
+
+```
+
+```{r}
+m_board <- lm(
+  gdp_growth ~ debt_lag1 + debt_lag1_2 +
+    delta_mfp + d_0809 + d_2021 +
+    debt_lag1:delta_mfp + debt_lag1:d_0809 + debt_lag1:d_2021,
+  data = canada_me
+)
+
+nw_vcov <- sandwich::vcovHAC(m_board)
+lmtest::coeftest(m_board, vcov = nw_vcov)
+
+stargazer(
+  m_board,
+  type = "text",
+  title = "Canada: Interactive Model (Lagged Debt, ΔMFP, Crisis Dummies)",
+  dep.var.labels = "GDP Growth (%)",
+  omit.stat = c("f","ser"),
+  digits = 3,
+  no.space = TRUE
+)
+```
+
+### Marginal Effects Computation
+
+```{r}
+b <- coef(m_board)
+
+canada_me <- canada_me %>%
+  mutate(
+    me_debt_lag1 =
+      b["debt_lag1"] +
+      2 * b["debt_lag1_2"] * debt_lag1 +
+      b["debt_lag1:delta_mfp"] * delta_mfp +
+      b["debt_lag1:d_0809"] * d_0809 +
+      b["debt_lag1:d_2021"] * d_2021
+  )
+```
+
+```{r}
+V <- sandwich::vcovHAC(m_board)
+
+# plug in numeric sample means (computed from the data used in m_board)
+xbar_d   <- mean(canada_me$debt_lag1,   na.rm = TRUE)
+xbar_dm  <- mean(canada_me$delta_mfp,  na.rm = TRUE)
+xbar_0809<- mean(canada_me$d_0809,     na.rm = TRUE)
+xbar_2021<- mean(canada_me$d_2021,     na.rm = TRUE)
+
+expr <- paste0(
+  "debt_lag1 + 2*debt_lag1_2*", xbar_d,
+  " + `debt_lag1:delta_mfp`*", xbar_dm,
+  " + `debt_lag1:d_0809`*", xbar_0809,
+  " + `debt_lag1:d_2021`*", xbar_2021
+)
+
+me_avg <- car::deltaMethod(m_board, g = expr, vcov. = V)
+
+me_est <- as.numeric(me_avg[1])
+me_se  <- as.numeric(me_avg[2])
+
+# helper: delta-method ME at chosen (d, dmfp, d0809, d2021)
+me_at <- function(d, dmfp, d0809, d2021, label) {
+  expr <- paste0(
+    "debt_lag1 + 2*debt_lag1_2*", d,
+    " + `debt_lag1:delta_mfp`*", dmfp,
+    " + `debt_lag1:d_0809`*", d0809,
+    " + `debt_lag1:d_2021`*", d2021
+  )
+  dm <- car::deltaMethod(m_board, g = expr, vcov. = V)
+  est <- as.numeric(dm[1]); se <- as.numeric(dm[2])
+  t   <- est / se
+  p   <- 2 * pt(abs(t), df = df.residual(m_board), lower.tail = FALSE)
+
+  data.frame(
+    Scenario = label,
+    Debt_eval = d,
+    dMFP_eval = dmfp,
+    d_0809 = d0809,
+    d_2021 = d2021,
+    ME = est,
+    `HAC SE` = se,
+    `t-stat` = t,
+    `p-value` = p,
+    `95% CI (low)` = est - 1.96 * se,
+    `95% CI (high)` = est + 1.96 * se
+  )
+}
+
+d_bar    <- mean(canada_me$debt_lag1, na.rm = TRUE)
+dmfp_bar <- mean(canada_me$delta_mfp, na.rm = TRUE)
+
+me_tbl <- bind_rows(
+  me_at(d_bar, dmfp_bar, 0, 0, "Normal year (means; no crisis)"),
+  me_at(d_bar, dmfp_bar, 1, 0, "2008–09 crisis year (means)"),
+  me_at(d_bar, dmfp_bar, 0, 1, "2020–21 crisis year (means)"),
+  me_at(d_bar, 0,        0, 0, "Normal year (ΔMFP = 0; no crisis)")
+)
+me_ultra_clean <- me_tbl %>%
+  dplyr::select(
+    Scenario,
+    ME,
+    X95..CI..low.,
+    X95..CI..high.
+  )
+
+stargazer(
+  me_ultra_clean,
+  type = "text",
+  title = "Canada: Marginal Effect of Lagged Debt-to-GDP on GDP Growth",
+  summary = FALSE,
+  digits = 4,
+  rownames = FALSE,
+  covariate.labels = c(
+    "Scenario",
+    "Marginal Effect",
+    "95% CI (Lower)",
+    "95% CI (Upper)"
+  ),
+  notes = "Marginal effects computed using the delta method with HAC standard errors."
+)
+```
+
+Plotting:
+
+```{r}
+ggplot(canada_me, aes(x = Year, y = me_debt_lag1)) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Canada: Marginal Effect of Lagged Debt-to-GDP on GDP Growth",
+    x = "Year",
+    y = "∂ŷ/∂Debt(t−1)"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+#GDPPC Regression
+
+## Baseline
+
+```{r}
+canada_gdppc <- canada_dum %>%
+  drop_na(gdppc_growth, delta_mfp)
+
+m_gdppc <- lm(
+  gdppc_growth ~ debt_gdp + I(debt_gdp^2) + delta_mfp + d_0809 + d_2021,
+  data = canada_gdppc
+)
+
+stargazer(
+  m_gdppc,
+  type = "text",
+  title = "Canada: GDP per Capita Growth Regression with Δlog(MFP) and Recession Dummies",
+  dep.var.labels = "GDP per Capita Growth (%)",
+  column.labels = "Base Model",
+  covariate.labels = c(
+    "Debt-to-GDP",
+    "Debt-to-GDP²",
+    "Δlog(MFP)",
+    "Dummy: 2008–2009",
+    "Dummy: 2020–2021"
+  ),
+  omit.stat = c("f", "ser"),
+  digits = 3,
+  no.space = TRUE
+)
+```
+
+Turning Points:
+
+```{r}
+b1 <- coef(m_gdppc)["debt_gdp"]
+b2 <- coef(m_gdppc)["I(debt_gdp^2)"]
+
+turning_point <- -b1 / (2 * b2)
+turning_point
+```
+
+#One Year Lagged 
+
+```{r}
+canada_gdppc_lag <- canada_dum %>%
+  arrange(Year) %>%
+  mutate(
+    gdppc_growth_lag1 = dplyr::lag(gdppc_growth, 1),
+    debt_lag1         = dplyr::lag(debt_gdp, 1),
+    debt_lag1_2       = debt_lag1^2
+  ) %>%
+  drop_na(
+    gdppc_growth, gdppc_growth_lag1,
+    debt_lag1, debt_lag1_2,
+    delta_mfp, d_0809, d_2021
+  )
+
+m_gdppc_lag1 <- lm(
+  gdppc_growth ~
+    debt_lag1 + debt_lag1_2 +
+    delta_mfp + d_0809 + d_2021,
+  data = canada_gdppc_lag
+)
+stargazer(
+  m_gdppc_lag1,
+  type = "text",
+  title = "Canada: GDP per Capita Growth with Lagged Debt-to-GDP",
+  dep.var.labels = "GDP per Capita Growth (%)",
+  covariate.labels = c(
+    "Debt-to-GDP (t−1)",
+    "Debt-to-GDP² (t−1)",
+    "Δ log(MFP)",
+    "Dummy: 2008–2009",
+    "Dummy: 2020–2021"
+  ),
+  omit.stat = c("f", "ser"),
+  digits = 3,
+  no.space = TRUE
+)
+
+```
+
+# Reasoning for Change in Log(MFP) in Baseline Regression:
+
+
+```{r}
+canada <- ca %>%
+  select(COUNTRY, Year, gdp_growth, debt_gdp,
+         gdp_per_capita, log_gdppc, log_mfp) %>%
+  arrange(Year) %>%
+  mutate(
+    gdppc_growth = 100 * (gdp_per_capita / dplyr::lag(gdp_per_capita) - 1)
+  )
+```
+
+```{r}
+canada_controls <- canada %>%
+  drop_na(gdp_growth, debt_gdp, log_mfp)
+
+m1 <- lm(
+  gdp_growth ~ debt_gdp + log_mfp,
+  data = canada_controls
+)
+
+m2 <- lm(
+  gdp_growth ~ debt_gdp + I(debt_gdp^2) + log_mfp,
+  data = canada_controls
+)
+
+tp <- -coef(m2)["debt_gdp"] / (2 * coef(m2)["I(debt_gdp^2)"])
+
+stargazer(
+  m1, m2,
+  type = "text",
+  title = "Canada: Growth Regressions with MFP",
+  dep.var.labels = "Real GDP Growth (%)",
+  column.labels  = c("Baseline", "Quadratic Debt"),
+  covariate.labels = c(
+    "Debt-to-GDP",
+    "Debt-to-GDP²",
+    "log(MFP)"
+  ),
+  omit.stat = c("f", "ser"),
+  digits = 3,
+  no.space = TRUE
+)
+```
+
+Plotting the Results:
+
+```{r}
+pred_canada <- canada_controls %>%
+  mutate(
+    pred_m1 = predict(m1, newdata = canada_controls),
+    pred_m2 = predict(m2, newdata = canada_controls)
+  )
+
+ggplot(canada_controls, aes(x = debt_gdp, y = gdp_growth)) +
+  geom_point(alpha = 0.6) +
+  geom_line(
+    data = pred_canada,
+    aes(y = pred_m1),
+    linetype = "dashed"
+  ) +
+  geom_line(
+    data = pred_canada,
+    aes(y = pred_m2)
+  ) +
+  geom_vline(
+    xintercept = as.numeric(tp),
+    linetype = "dotted"
+  ) +
+  annotate(
+    "text",
+    x = as.numeric(tp),
+    y = min(canada_controls$gdp_growth, na.rm = TRUE),
+    label = paste0("TP ≈ ", round(tp, 1), "%"),
+    vjust = -0.5,
+    angle = 90
+  ) +
+  labs(
+    x = "Debt-to-GDP ratio (%)",
+    y = "Real GDP growth (%)",
+    title = "Canada: GDP Growth vs Debt-to-GDP",
+    subtitle = "Points = data; dashed = linear fit; solid = quadratic fit; dotted = turning point"
+  ) +
+  theme_minimal()
+```
+
+## Lagged MFP versus Non Lagged MFP
+
+```{r}
+canada_lag <- canada %>%
+  arrange(Year) %>%
+  mutate(
+    mfp_lag  = dplyr::lag(log_mfp, 1),
+    debt_lag = dplyr::lag(debt_gdp, 1)
+  ) %>%
+  drop_na(gdp_growth, debt_gdp, mfp_lag)
+
+m_lag1 <- lm(
+  gdp_growth ~ debt_gdp + I(debt_gdp^2) + mfp_lag,
+  data = canada_lag
+)
+
+stargazer(
+  m_lag1,
+  type = "text",
+  title = "Canada: Lagged MFP Regression (Dependent Variable: GDP Growth)",
+  dep.var.labels = "GDP Growth (%)",
+  column.labels = "Lagged MFP Model",
+  covariate.labels = c(
+    "Debt-to-GDP",
+    "Debt-to-GDP²",
+    "Lagged log(MFP)"
+  ),
+  omit.stat = c("f", "ser"),
+  digits = 3,
+  no.space = TRUE
+)
+```
+
+## Change in MFP:
+
+```{r}
+canada_delta <- canada %>%
+  arrange(Year) %>%
+  mutate(
+    # MFP growth in percentage points
+    delta_mfp = 100 * (log_mfp - dplyr::lag(log_mfp, 1))
+  ) %>%
+  drop_na(delta_mfp, gdp_growth, debt_gdp, log_mfp)
+
+m_dynamic <- lm(
+  gdp_growth ~ debt_gdp + I(debt_gdp^2) + delta_mfp,
+  data = canada_delta
+)
+
+stargazer(
+  m2, m_dynamic,
+  type = "text",
+  title = "Canada: Comparing Productivity Specifications",
+  column.labels = c("Quadratic Debt + log(MFP)", "Quadratic Debt + Δlog(MFP)"),
+  dep.var.labels = "Real GDP Growth (%)",
+  covariate.labels = c(
+    "Debt-to-GDP",
+    "Debt-to-GDP²",
+    "log(MFP)",
+    "Δlog(MFP)"
+  ),
+  omit.stat = c("f", "ser"),
+  digits = 3,
+  no.space = TRUE
+)
+```
+#Rolling Analysis
+
+## Rolling 12 Year Turning Point Analysis:
+
+```{r}
+roll_tp <- function(df, window_size = 12) {
+
+  years <- df$Year
+
+  results <- lapply(1:(length(years) - window_size + 1), function(i) {
+
+    sub <- df %>%
+      filter(Year >= years[i], Year < years[i] + window_size)
+
+    if (nrow(sub) < window_size - 2) return(NULL)
+
+    fit <- tryCatch(
+      lm(gdp_growth ~ debt_gdp + I(debt_gdp^2), data = sub),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) return(NULL)
+
+    co <- coef(fit)
+    b1 <- co["debt_gdp"]
+    b2 <- co["I(debt_gdp^2)"]
+    tp <- -b1 / (2 * b2)
+
+    tp_se <- {
+      vc <- vcov(fit)
+      sqrt(
+        vc["debt_gdp","debt_gdp"] / (4 * b2^2) +
+        (b1^2 * vc["I(debt_gdp^2)","I(debt_gdp^2)"]) / (4 * b2^4) -
+        (b1 * vc["debt_gdp","I(debt_gdp^2)"]) / (2 * b2^3)
+      )
+    }
+
+    tibble(
+      start = years[i],
+      end   = years[i] + window_size - 1,
+      tp     = tp,
+      tp_low = tp - 1.96 * tp_se,
+      tp_high = tp + 1.96 * tp_se,
+      beta2 = b2
+    )
+  })
+
+  bind_rows(results)
+}
+
+tp_ca <- roll_tp(ca, window_size = 12)
+```
+
+Plotting the results:
+
+```{r}
+ggplot(tp_ca, aes(x = end, y = tp)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Canada: Rolling Turning Point (12-Year Windows)",
+    x = "End Year",
+    y = "Turning Point (% Debt-to-GDP)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Split - Sample Analysis (\>2007 vs 2008\<)
+
+```{r}
+ca_pre  <- ca %>% filter(Year <= 2007)
+ca_post <- ca %>% filter(Year >= 2008)
+
+m_pre  <- lm(gdp_growth ~ debt_gdp + I(debt_gdp^2), data = ca_pre)
+m_post <- lm(gdp_growth ~ debt_gdp + I(debt_gdp^2), data = ca_post)
+```
+
+```{r}
+tp_pre  <- -coef(m_pre)["debt_gdp"] / (2 * coef(m_pre)["I(debt_gdp^2)"])
+tp_post <- -coef(m_post)["debt_gdp"] / (2 * coef(m_post)["I(debt_gdp^2)"])
+```
+
+Plotting:
+
+```{r}
+ggplot() +
+  geom_point(data = ca_pre, aes(debt_gdp, gdp_growth), color = "#0072B2") +
+  geom_line(data = ca_pre, aes(debt_gdp, predict(m_pre)), color = "#0072B2") +
+  geom_point(data = ca_post, aes(debt_gdp, gdp_growth), color = "#D55E00") +
+  geom_line(data = ca_post, aes(debt_gdp, predict(m_post)), color = "#D55E00") +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Debt–Growth Curve Before vs After 2008",
+    x = "Debt-to-GDP (%)",
+    y = "GDP Growth (%)"
+  )
+```
+
+## Rolling 10 Year Correlation:
+
+```{r}
+ca_corr <- ca %>%
+  arrange(Year) %>%
+  mutate(
+    roll_corr = rollapply(
+      data = cbind(gdp_growth, debt_gdp),
+      width = 10,
+      FUN = function(z) cor(z[,1], z[,2], use = "complete.obs"),
+      by.column = FALSE,
+      fill = NA,
+      align = "right"
+    )
+  )
+```
+
+```{r}
+ggplot(ca_corr, aes(Year, roll_corr)) +
+  geom_line(color = "#0072B2", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Canada: Rolling 10-Year Correlation Between Debt and Growth",
+    x = "Year",
+    y = "Correlation"
+  ) +
+  theme_minimal(base_size = 1)
+```
+
+
+# MFP "shock" Series:
+
+Constructing the dataset:
+
+```{r}
+canada_cf <- canada_master %>%
+  arrange(Year) %>%
+  mutate(
+    debt_lag1 = dplyr::lag(debt_gdp, 1),
+    debt_lag2 = dplyr::lag(debt_gdp, 2)
+  ) %>%
+  drop_na(delta_mfp, gdp_growth, debt_lag1)
+```
+
+The baseline linear regression with MFP on the LS:
+
+```{r}
+mfp_fs <- lm(delta_mfp ~ debt_lag1, data = canada_cf)
+
+canada_cf <- canada_cf %>%
+  mutate(
+    mfp_hat   = fitted(mfp_fs),
+    mfp_shock = resid(mfp_fs)  
+  )
+stargazer(
+  mfp_fs,
+  type = "text",
+  title = "First-Stage Regression: Determinants of MFP Growth",
+  dep.var.labels = "Δlog(MFP) (%)",
+  covariate.labels = c(
+    "Lagged Debt-to-GDP (t−1)"
+  ),
+  omit.stat = c("f","ser"),
+  digits = 3,
+  no.space = TRUE,
+  notes = "Residuals from this regression are used as productivity shocks in the GDP growth regressions."
+)
+```
+
+
+## MFP driven by lagged debt only and dummies:
+
+```{r}
+mfp_fs_rich <- lm(delta_mfp ~ debt_lag1 + d_0809 + d_2021, data = canada_cf)
+
+canada_cf <- canada_cf %>%
+  mutate(
+    mfp_hat   = fitted(mfp_fs_rich),
+    mfp_shock = resid(mfp_fs_rich)
+  )
+
+stargazer(
+  mfp_fs_rich,
+  type = "text",
+  title = "First-Stage Regression (Rich): Determinants of MFP Growth",
+  dep.var.labels = "Δlog(MFP) (%)",
+  covariate.labels = c(
+    "Lagged Debt-to-GDP (t−1)",
+    "Dummy: 2008–2009",
+    "Dummy: 2020–2021"
+  ),
+  omit.stat = c("f","ser"),
+  digits = 3,
+  no.space = TRUE,
+  notes = "Residuals from this regression (mfp_shock) are used as productivity shocks in the GDP growth regressions."
+)
+```
+
+
+Now, showing the growth on debt + MFP shocks 
+
+```{r}
+
+m_cf_lin <- lm(gdp_growth ~ debt_lag1 + mfp_shock, data = canada_cf)
+m_cf_quad <- lm(gdp_growth ~ debt_lag1 + I(debt_lag1^2) + mfp_shock, data = canada_cf)
+
+stargazer(
+  m_cf_lin, m_cf_quad,
+  type = "text",
+  title = "Canada: Control-Function Style Regressions (MFP Shock Residual)",
+  column.labels = c("Linear debt", "Quadratic debt"),
+  dep.var.labels = "Real GDP Growth (%)",
+  covariate.labels = c(
+    "Debt-to-GDP (t−1)",
+    "Debt-to-GDP² (t−1)",
+    "MFP shock (first-stage residual)"
+  ),
+  omit.stat = c("f","ser"),
+  digits = 3,
+  no.space = TRUE
+)
+```
+
+Turning Points:
+
+```{r}
+b1 <- coef(m_cf_quad)["debt_lag1"]
+b2 <- coef(m_cf_quad)["I(debt_lag1^2)"]
+tp_cf <- -b1 / (2*b2)
+tp_cf
+```
+
+
+## Adding the shock MFP into the interactive model:
+
+```{r}
+m_board_cf <- lm(
+  gdp_growth ~ debt_lag1 + I(debt_lag1^2) +
+    mfp_shock + d_0809 + d_2021 +
+    debt_lag1:mfp_shock + debt_lag1:d_0809 + debt_lag1:d_2021,
+  data = canada_cf
+)
+
+V_hac  <- vcovHAC(m_board_cf)
+se_hac <- sqrt(diag(V_hac))
+
+
+stargazer(
+  m_board_cf,
+  type = "text",
+  title = "Canada: Interactive Model with MFP Shock (HAC Standard Errors)",
+  dep.var.labels = "Real GDP Growth (%)",
+  covariate.labels = c(
+    "Debt-to-GDP (t−1)",
+    "Debt-to-GDP² (t−1)",
+    "MFP shock (residual)",
+    "Dummy: 2008–2009",
+    "Dummy: 2020–2021",
+    "Debt(t−1) × MFP shock",
+    "Debt(t−1) × 2008–2009",
+    "Debt(t−1) × 2020–2021"
+  ),
+  se = list(se_hac),
+  omit.stat = c("f", "ser"),
+  digits = 3,
+  no.space = TRUE,
+  notes = "HAC standard errors from vcovHAC()."
+)
+```
+
+Graphing:
+
+```{r}
+ggplot(canada_cf, aes(x = Year)) +
+  geom_line(aes(y = delta_mfp, color = "Actual ΔMFP"), linewidth = 1.1) +
+  geom_line(aes(y = mfp_hat, color = "Predicted ΔMFP"), linewidth = 1.1, linetype = "dashed") +
+  labs(
+    title = "Canada: Actual vs Predicted MFP Growth",
+    subtitle = "Predicted values from first-stage regression",
+    x = "Year",
+    y = "Δlog(MFP) (%)",
+    color = ""
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+
+Time Series of MFP Shocks:
+
+```{r}
+ggplot(canada_cf, aes(x = Year, y = mfp_shock)) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Canada: Productivity Shocks (First-Stage Residuals)",
+    x = "Year",
+    y = "MFP shock (Δlog(MFP) residual)"
+  ) +
+  theme_minimal(base_size = 13)
+```
